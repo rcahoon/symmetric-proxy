@@ -62,6 +62,14 @@ namespace tcp_proxy
 {
    namespace ip = boost::asio::ip;
 
+   const unsigned char kKey = 42;
+
+   void encrypt(unsigned char* data, size_t length) {
+      for (size_t i = 0; i < length; ++i, ++data) {
+         *data ^= kKey;
+      }
+   }
+
    class bridge : public boost::enable_shared_from_this<bridge>
    {
    public:
@@ -135,6 +143,7 @@ namespace tcp_proxy
       {
          if (!error)
          {
+            encrypt(upstream_data_,bytes_transferred);
             async_write(downstream_socket_,
                  boost::asio::buffer(upstream_data_,bytes_transferred),
                  boost::bind(&bridge::handle_downstream_write,
@@ -174,6 +183,7 @@ namespace tcp_proxy
       {
          if (!error)
          {
+            encrypt(downstream_data_,bytes_transferred);
             async_write(upstream_socket_,
                   boost::asio::buffer(downstream_data_,bytes_transferred),
                   boost::bind(&bridge::handle_upstream_write,
