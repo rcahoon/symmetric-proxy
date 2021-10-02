@@ -1,0 +1,3 @@
+[submodule "TurboBase64"]
+	path = TurboBase64
+	url = git@github.com:rcahoon/Turbo-Base64.git

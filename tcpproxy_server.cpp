@@ -57,6 +57,8 @@
 #include <boost/asio.hpp>
 #include <boost/thread/mutex.hpp>
 
+#include "TurboBase64/turbob64.h"
+
 
 namespace tcp_proxy
 {
@@ -64,11 +66,9 @@ namespace tcp_proxy
 
    const unsigned char kKey = 42;
 
-   void encrypt(unsigned char* data, size_t length) {
-      for (size_t i = 0; i < length; ++i, ++data) {
-         *data ^= kKey;
-      }
-   }
+   // Default to false because it's more strict (it will fail if somebody
+   // meant to encode).
+   bool g_encode = false;
 
    class bridge : public boost::enable_shared_from_this<bridge>
    {
@@ -94,6 +94,16 @@ namespace tcp_proxy
          return upstream_socket_;
       }
 
+      socket_type& ciphertext_socket()
+      {
+         return g_encode ? upstream_socket_ : downstream_socket_;
+      }
+
+      socket_type& plaintext_socket()
+      {
+         return g_encode ? downstream_socket_ : upstream_socket_;
+      }
+
       void start(const std::string& upstream_host, unsigned short upstream_port)
       {
          // Attempt connection to remote server (upstream side)
@@ -101,27 +111,27 @@ namespace tcp_proxy
               ip::tcp::endpoint(
                    boost::asio::ip::address::from_string(upstream_host),
                    upstream_port),
-               boost::bind(&bridge::handle_upstream_connect,
-                    shared_from_this(),
-                    boost::asio::placeholders::error));
+              boost::bind(&bridge::handle_upstream_connect,
+                   shared_from_this(),
+                   boost::asio::placeholders::error));
       }
 
       void handle_upstream_connect(const boost::system::error_code& error)
       {
          if (!error)
          {
-            // Setup async read from remote server (upstream)
-            upstream_socket_.async_read_some(
-                 boost::asio::buffer(upstream_data_,max_data_length),
-                 boost::bind(&bridge::handle_upstream_read,
+            boost::asio::async_read_until(
+                 ciphertext_socket(),
+                 ciphertext_buffer_,
+                 b64_terminator,
+                 boost::bind(&bridge::handle_ciphertext_read,
                       shared_from_this(),
                       boost::asio::placeholders::error,
                       boost::asio::placeholders::bytes_transferred));
 
-            // Setup async read from client (downstream)
-            downstream_socket_.async_read_some(
-                 boost::asio::buffer(downstream_data_,max_data_length),
-                 boost::bind(&bridge::handle_downstream_read,
+            plaintext_socket().async_read_some(
+                 boost::asio::buffer(plaintext_data_,max_data_length),
+                 boost::bind(&bridge::handle_plaintext_read,
                       shared_from_this(),
                       boost::asio::placeholders::error,
                       boost::asio::placeholders::bytes_transferred));
@@ -131,6 +141,53 @@ namespace tcp_proxy
       }
 
    private:
+      static const char b64_terminator = '\n';
+
+      bool encrypt(unsigned char* const data,
+                   const size_t length,
+                   unsigned char* const processed,
+                   size_t& processed_length)
+      {
+         for (size_t i = 0; i < length; ++i)
+         {
+            data[i] ^= kKey;
+         }
+         processed_length = tb64enc(data, length, processed);
+         if (processed_length <= 0)
+         {
+            return false;
+         }
+         processed[processed_length] = b64_terminator;
+         ++processed_length;
+         return true;
+      }
+
+      bool decrypt(unsigned char* const data,
+                   size_t length,
+                   unsigned char* const processed,
+                   size_t& processed_length)
+      {
+         if (length == 0)
+         {
+            return false;
+         }
+         --length;
+         if (data[length] != b64_terminator)
+         {
+            return false;
+         }
+         processed_length = tb64dec(data, length, processed);
+         if (processed_length <= 0)
+         {
+            return false;
+         }
+         for (size_t i = 0; i < processed_length; ++i)
+         {
+            processed[i] ^= kKey;
+         }
+         return true;
+      }
+
 
       /*
          Section A: Remote Server --> Proxy --> Client
@@ -138,30 +195,47 @@ namespace tcp_proxy
       */
 
       // Read from remote server complete, now send data to client
-      void handle_upstream_read(const boost::system::error_code& error,
-                                const size_t& bytes_transferred)
+      void handle_ciphertext_read(const boost::system::error_code& error,
+                                  const size_t& bytes_transferred)
       {
          if (!error)
          {
-            encrypt(upstream_data_,bytes_transferred);
-            async_write(downstream_socket_,
-                 boost::asio::buffer(upstream_data_,bytes_transferred),
-                 boost::bind(&bridge::handle_downstream_write,
-                      shared_from_this(),
-                      boost::asio::placeholders::error));
+            size_t bytes_to_send;
+            if (bytes_transferred > max_encoded_data_length)
+            {
+               close();
+            }
+            if (!std::istream(&ciphertext_buffer_).read((char*)ciphertext_data_, bytes_transferred))
+            {
+               close();
+            }
+            else if (!decrypt(ciphertext_data_,bytes_transferred,ciphertext_decoded_data_,bytes_to_send))
+            {
+               close();
+            }
+            else
+            {
+               async_write(plaintext_socket(),
+                    boost::asio::buffer(ciphertext_decoded_data_,bytes_to_send),
+                    boost::bind(&bridge::handle_plaintext_write,
+                         shared_from_this(),
+                         boost::asio::placeholders::error));
+            }
          }
          else
             close();
       }
 
       // Write to client complete, Async read from remote server
-      void handle_downstream_write(const boost::system::error_code& error)
+      void handle_plaintext_write(const boost::system::error_code& error)
       {
          if (!error)
          {
-            upstream_socket_.async_read_some(
-                 boost::asio::buffer(upstream_data_,max_data_length),
-                 boost::bind(&bridge::handle_upstream_read,
+            boost::asio::async_read_until(
+                 ciphertext_socket(),
+                 ciphertext_buffer_,
+                 b64_terminator,
+                 boost::bind(&bridge::handle_ciphertext_read,
                       shared_from_this(),
                       boost::asio::placeholders::error,
                       boost::asio::placeholders::bytes_transferred));
@@ -178,30 +252,39 @@ namespace tcp_proxy
       */
 
       // Read from client complete, now send data to remote server
-      void handle_downstream_read(const boost::system::error_code& error,
-                                  const size_t& bytes_transferred)
+      void handle_plaintext_read(const boost::system::error_code& error,
+                                 const size_t& bytes_transferred)
       {
          if (!error)
          {
-            encrypt(downstream_data_,bytes_transferred);
-            async_write(upstream_socket_,
-                  boost::asio::buffer(downstream_data_,bytes_transferred),
-                  boost::bind(&bridge::handle_upstream_write,
-                        shared_from_this(),
-                        boost::asio::placeholders::error));
+            bool result;
+            size_t bytes_to_send;
+            result = encrypt(plaintext_data_,bytes_transferred,plaintext_encoded_data_,bytes_to_send);
+            if (!result)
+            {
+               close();
+            }
+            else
+            {
+               async_write(ciphertext_socket(),
+                     boost::asio::buffer(plaintext_encoded_data_,bytes_to_send),
+                     boost::bind(&bridge::handle_ciphertext_write,
+                           shared_from_this(),
+                           boost::asio::placeholders::error));
+            }
          }
          else
             close();
       }
 
       // Write to remote server complete, Async read from client
-      void handle_upstream_write(const boost::system::error_code& error)
+      void handle_ciphertext_write(const boost::system::error_code& error)
       {
          if (!error)
          {
-            downstream_socket_.async_read_some(
-                 boost::asio::buffer(downstream_data_,max_data_length),
-                 boost::bind(&bridge::handle_downstream_read,
+            plaintext_socket().async_read_some(
+                 boost::asio::buffer(plaintext_data_,max_data_length),
+                 boost::bind(&bridge::handle_plaintext_read,
                       shared_from_this(),
                       boost::asio::placeholders::error,
                       boost::asio::placeholders::bytes_transferred));
@@ -229,9 +312,15 @@ namespace tcp_proxy
       socket_type downstream_socket_;
       socket_type upstream_socket_;
 
-      enum { max_data_length = 8192 }; //8KB
-      unsigned char downstream_data_[max_data_length];
-      unsigned char upstream_data_  [max_data_length];
+      enum {
+         max_data_length = 8192, //8KB
+         max_encoded_data_length = TB64ENCLEN(max_data_length) + 1
+      };
+      boost::asio::streambuf ciphertext_buffer_;
+      unsigned char plaintext_data_[max_data_length];
+      unsigned char plaintext_encoded_data_[max_encoded_data_length];
+      unsigned char ciphertext_data_[max_encoded_data_length];
+      unsigned char ciphertext_decoded_data_[max_data_length];
 
       boost::mutex mutex_;
 
@@ -301,18 +390,37 @@ namespace tcp_proxy
    };
 }
 
+void usage()
+{
+   std::cerr << "usage: tcpproxy_server <local host ip> <local port> <forward host ip> <forward port> (encode|decode)" << std::endl;
+   std::exit(1);
+}
+
 int main(int argc, char* argv[])
 {
-   if (argc != 5)
+   if (argc != 6)
    {
-      std::cerr << "usage: tcpproxy_server <local host ip> <local port> <forward host ip> <forward port>" << std::endl;
-      return 1;
+      usage();
    }
 
    const unsigned short local_port   = static_cast<unsigned short>(::atoi(argv[2]));
    const unsigned short forward_port = static_cast<unsigned short>(::atoi(argv[4]));
    const std::string local_host      = argv[1];
    const std::string forward_host    = argv[3];
+   const std::string direction       = argv[5];
+
+   if (direction == "encode")
+   {
+      tcp_proxy::g_encode = true;
+   }
+   else if (direction == "decode")
+   {
+      tcp_proxy::g_encode = false;
+   }
+   else
+   {
+      usage();
+   }
 
    boost::asio::io_service ios;
 

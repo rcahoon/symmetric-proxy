@@ -14,6 +14,7 @@ OPTIMIZATION_OPT = -O3
 OPTIONS          = -pedantic -ansi -Wall -Werror $(OPTIMIZATION_OPT) -o
 PTHREAD          = -lpthread
 LINKER_OPT       = -L/usr/lib -lstdc++ $(PTHREAD) -lboost_thread -lboost_system
+LINKER_OPT       += -LTurboBase64 -ltb64
 
 BUILD_LIST+=tcpproxy_server
 
