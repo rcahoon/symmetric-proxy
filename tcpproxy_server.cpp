@@ -137,7 +137,10 @@ namespace tcp_proxy
                       boost::asio::placeholders::bytes_transferred));
          }
          else
+         {
+            std::cerr << "upstream connect fail" << error << "\n";
             close();
+         }
       }
 
    private:
@@ -148,6 +151,9 @@ namespace tcp_proxy
                    unsigned char* const processed,
                    size_t& processed_length)
       {
+      #ifdef PRINT_DATA
+         std::cout << "Received " << std::string((const char*)data, length) << "\n";
+      #endif
          for (size_t i = 0; i < length; ++i)
          {
             data[i] ^= kKey;
@@ -159,6 +165,9 @@ namespace tcp_proxy
          }
          processed[processed_length] = b64_terminator;
          ++processed_length;
+      #ifdef PRINT_DATA
+         std::cout << "Send " << std::string((const char*)processed, processed_length) << "\n";
+      #endif
          return true;
       }
 
@@ -167,6 +176,9 @@ namespace tcp_proxy
                    unsigned char* const processed,
                    size_t& processed_length)
       {
+      #ifdef PRINT_DATA
+         std::cout << "Received " << std::string((const char*)data, length) << "\n";
+      #endif
          if (length == 0)
          {
             return false;
@@ -185,6 +197,9 @@ namespace tcp_proxy
          {
             processed[i] ^= kKey;
          }
+      #ifdef PRINT_DATA
+         std::cout << "Send " << std::string((const char*)processed, processed_length) << "\n";
+      #endif
          return true;
       }
 
@@ -203,14 +218,17 @@ namespace tcp_proxy
             size_t bytes_to_send;
             if (bytes_transferred > max_encoded_data_length)
             {
+               std::cerr << "ciphertext is too long\n";
                close();
             }
             if (!std::istream(&ciphertext_buffer_).read((char*)ciphertext_data_, bytes_transferred))
             {
+               std::cerr << "consume ciphertext fail\n";
                close();
             }
             else if (!decrypt(ciphertext_data_,bytes_transferred,ciphertext_decoded_data_,bytes_to_send))
             {
+               std::cerr << "decrypt fail " << std::string((const char*)ciphertext_data_, bytes_transferred) << "\n";
                close();
             }
             else
@@ -223,7 +241,15 @@ namespace tcp_proxy
             }
          }
          else
+         {
+            if (error != boost::asio::error::eof &&
+                error != boost::asio::error::operation_aborted &&
+                error != boost::asio::error::connection_reset)
+            {
+               std::cerr << "ciphertext read fail " << error << "\n";
+            }
             close();
+         }
       }
 
       // Write to client complete, Async read from remote server
@@ -241,7 +267,13 @@ namespace tcp_proxy
                       boost::asio::placeholders::bytes_transferred));
          }
          else
+         {
+            if (error != boost::asio::error::connection_reset)
+            {
+               std::cerr << "plaintext write fail " << error << "\n";
+            }
             close();
+         }
       }
       // *** End Of Section A ***
 
@@ -262,6 +294,7 @@ namespace tcp_proxy
             result = encrypt(plaintext_data_,bytes_transferred,plaintext_encoded_data_,bytes_to_send);
             if (!result)
             {
+               std::cerr << "encrypt fail " << std::string((const char*)plaintext_data_, bytes_transferred) << "\n";
                close();
             }
             else
@@ -274,7 +307,15 @@ namespace tcp_proxy
             }
          }
          else
+         {
+            if (error != boost::asio::error::eof &&
+                error != boost::asio::error::operation_aborted &&
+                error != boost::asio::error::connection_reset)
+            {
+               std::cerr << "plaintext read fail " << error << "\n";
+            }
             close();
+         }
       }
 
       // Write to remote server complete, Async read from client
@@ -290,7 +331,13 @@ namespace tcp_proxy
                       boost::asio::placeholders::bytes_transferred));
          }
          else
+         {
+            if (error != boost::asio::error::connection_reset)
+            {
+               std::cerr << "ciphertext write fail " << error << "\n";
+            }
             close();
+         }
       }
       // *** End Of Section B ***
 
